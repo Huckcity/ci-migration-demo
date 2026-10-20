@@ -1,0 +1,208 @@
+name: ci-migration-demo
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request: {}
+  workflow_dispatch: {}
+env:
+  NODE_ENV: test
+  DOCKER_DRIVER: overlay2
+  CI_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+  CI_REGISTRY_USER: ${{ github.actor }}
+  CI_REGISTRY: ghcr.io
+  CI_REGISTRY_IMAGE: ghcr.io/${{ github.repository }}
+  CI_COMMIT_SHORT_SHA: ${{ github.sha }}
+  CI_COMMIT_SHA: ${{ github.sha }}
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    container:
+      image: node:20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Cache deps
+        uses: actions/cache@v4
+        with:
+          path: node_modules/
+          key: ${{ runner.os }}-deps-${{ hashFiles('package-lock.json') }}
+          restore-keys: ${{ runner.os }}-deps-
+      - name: Before script
+        run: npm ci
+      - name: npm run build
+        run: npm run build
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-artifacts
+          path: dist/
+          retention-days: 7
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    container:
+      image: node:20
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Cache deps
+        uses: actions/cache@v4
+        with:
+          path: node_modules/
+          key: ${{ runner.os }}-deps-${{ hashFiles('package-lock.json') }}
+          restore-keys: ${{ runner.os }}-deps-
+      - name: Before script
+        run: npm ci
+      - name: npm run lint
+        run: npm run lint
+  unit:
+    name: unit
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: (github.event_name == 'pull_request') || (github.ref == 'refs/heads/main')
+    container:
+      image: node:20
+    strategy:
+      matrix:
+        index: [0, 1, 2]
+    env:
+      CI_NODE_INDEX: ${{ matrix.index }}
+      CI_NODE_TOTAL: '3'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Cache deps
+        uses: actions/cache@v4
+        with:
+          path: node_modules/
+          key: ${{ runner.os }}-deps-${{ hashFiles('package-lock.json') }}
+          restore-keys: ${{ runner.os }}-deps-
+      - name: Download artifacts from build
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+      - name: Before script
+        run: npm ci
+      - name: npm test -- --reporter junit --output junit.xml
+        run: npm test -- --reporter junit --output junit.xml
+      - name: Publish test results
+        uses: mikepenz/action-junit-report@v5
+        if: always()
+        with:
+          report_paths: junit.xml
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: (github.ref == 'refs/heads/main') || (startsWith(github.ref_name, 'release/'))
+    container:
+      image: node:20
+    services:
+      postgres:
+        image: postgres:16
+      cache:
+        image: redis:7
+    timeout-minutes: 90
+    env:
+      POSTGRES_PASSWORD: pw
+      DATABASE_URL: postgres://postgres:pw@postgres/test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Cache deps
+        uses: actions/cache@v4
+        with:
+          path: node_modules/
+          key: ${{ runner.os }}-deps-${{ hashFiles('package-lock.json') }}
+          restore-keys: ${{ runner.os }}-deps-
+      - name: Download artifacts from build
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+      - name: Before script
+        run: npm ci
+      - name: npm run test:integration
+        run: npm run test:integration
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+    needs: [build, lint, unit, integration]
+    if: (startsWith(github.ref, 'refs/tags/')) || (github.ref == 'refs/heads/main')
+    container:
+      image: docker:27
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Cache deps
+        uses: actions/cache@v4
+        with:
+          path: node_modules/
+          key: ${{ runner.os }}-deps-${{ hashFiles('package-lock.json') }}
+          restore-keys: ${{ runner.os }}-deps-
+      - name: Download artifacts from build
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+      - name: echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGIS…
+        run: |
+          echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
+          docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA .
+          docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  deploy-staging:
+    name: deploy-staging
+    runs-on: ubuntu-latest
+    needs: [build, lint, unit, integration]
+    if: (github.ref == 'refs/heads/main')
+    environment: staging
+    container:
+      image: alpine:3.19
+    env:
+      DEPLOY_ENV: staging
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Cache deps
+        uses: actions/cache@v4
+        with:
+          path: node_modules/
+          key: ${{ runner.os }}-deps-${{ hashFiles('package-lock.json') }}
+          restore-keys: ${{ runner.os }}-deps-
+      - name: Download artifacts from build
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+      - name: apk add --no-cache curl
+        run: |
+          apk add --no-cache curl
+          ./deploy.sh $CI_COMMIT_SHA $DEPLOY_ENV
+  deploy-prod:
+    name: deploy-prod
+    runs-on: ubuntu-latest
+    needs: [build, lint, unit, integration]
+    if: (startsWith(github.ref, 'refs/tags/'))
+    environment: production
+    container:
+      image: alpine:3.19
+    env:
+      DEPLOY_ENV: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Cache deps
+        uses: actions/cache@v4
+        with:
+          path: node_modules/
+          key: ${{ runner.os }}-deps-${{ hashFiles('package-lock.json') }}
+          restore-keys: ${{ runner.os }}-deps-
+      - name: Download artifacts from build
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+      - name: apk add --no-cache curl
+        run: |
+          apk add --no-cache curl
+          ./deploy.sh $CI_COMMIT_SHA $DEPLOY_ENV
