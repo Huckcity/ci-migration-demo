@@ -1,0 +1,136 @@
+name: ci-migration-demo
+on:
+  push:
+    branches: [main, 'release/*']
+    tags: ['*']
+  pull_request:
+    branches: [main, 'release/*']
+  workflow_dispatch: {}
+jobs:
+  test:
+    name: test (${{ matrix.os_name }}, ${{ matrix.node }}, ${{ matrix.DB }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            os_name: linux
+            node: '18'
+            DB: postgres
+          - os: ubuntu-22.04
+            os_name: linux
+            node: '18'
+            DB: sqlite
+          - os: ubuntu-22.04
+            os_name: linux
+            node: '20'
+            DB: postgres
+          - os: ubuntu-22.04
+            os_name: linux
+            node: '20'
+            DB: sqlite
+          - os: macos-latest
+            os_name: osx
+            node: '18'
+            DB: sqlite
+            experimental: true
+          - os: macos-latest
+            os_name: osx
+            node: '20'
+            DB: postgres
+            experimental: true
+          - os: macos-latest
+            os_name: osx
+            node: '20'
+            DB: sqlite
+            experimental: true
+      fail-fast: false
+    continue-on-error: ${{ matrix.experimental == true }}
+    env:
+      CI: 'true'
+      DB: ${{ matrix.DB }}
+      TRAVIS_OS_NAME: ${{ matrix.os_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install apt packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxml2-dev
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            ~/.npm
+          key: "${{ runner.os }}-node_js-${{ hashFiles('**/package-lock.json', '**/yarn.lock', '**/Gemfile.lock', '**/requirements*.txt', '**/Cargo.lock', '**/pom.xml', '**/go.sum') }}"
+          restore-keys: ${{ runner.os }}-node_js-
+      - name: before install
+        run: npm install -g npm@latest
+      - name: install
+        run: npm ci
+      - name: npm run lint
+        run: |
+          npm run lint
+          npm test -- --db $DB
+      - name: after success
+        run: npx codecov
+        if: success()
+      - name: after failure
+        run: cat npm-debug.log
+        if: failure()
+  publish-package:
+    name: Publish package
+    runs-on: ubuntu-22.04
+    needs: [test]
+    if: ((github.ref_name == 'main') || (startsWith(github.ref, 'refs/tags/'))) && startsWith(github.ref, 'refs/tags/')
+    services:
+      postgresql:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: [5432:5432]
+      redis:
+        image: redis:7
+        ports: [6379:6379]
+    env:
+      CI: 'true'
+      TRAVIS_OS_NAME: linux
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install apt packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxml2-dev
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            ~/.npm
+          key: "${{ runner.os }}-node_js-${{ hashFiles('**/package-lock.json', '**/yarn.lock', '**/Gemfile.lock', '**/requirements*.txt', '**/Cargo.lock', '**/pom.xml', '**/go.sum') }}"
+          restore-keys: ${{ runner.os }}-node_js-
+      - name: before install
+        run: npm install -g npm@latest
+      - name: install
+        run: npm ci
+      - name: npm run build
+        run: npm run build
+      - name: after success
+        run: npx codecov
+        if: success()
+      - name: after failure
+        run: cat npm-debug.log
+        if: failure()
+      - name: Publish to npm
+        if: startsWith(github.ref, 'refs/tags/')
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
