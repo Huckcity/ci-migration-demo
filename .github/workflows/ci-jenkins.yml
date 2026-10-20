@@ -1,0 +1,163 @@
+name: Jenkinsfile
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      DEPLOY_ENV:
+        description: Target environment
+        type: string
+        default: staging
+        required: false
+      RUN_E2E:
+        description: Run end-to-end tests
+        type: boolean
+        default: false
+        required: false
+      LOG_LEVEL:
+        description: Log level
+        type: choice
+        options: [info, debug, trace]
+        default: info
+env:
+  REGISTRY: ghcr.io/acme
+  IMAGE: ghcr.io/acme/api:${{ github.run_number }}
+  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+  MAVEN_OPTS: '-Xmx2g'
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  checkout:
+    name: Checkout
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: git rev-parse --short HEAD > commit.txt
+        run: git rev-parse --short HEAD > commit.txt
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [checkout]
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: mvn -B -ntp clean package -DskipTests
+        run: mvn -B -ntp clean package -DskipTests
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts
+          path: 'target/*.jar'
+      - name: Stash jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: stash-jar
+          path: 'target/*.jar'
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: "!(startsWith(github.ref, 'refs/heads/release/'))"
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: mvn -B -ntp test
+        run: |
+          mvn -B -ntp test
+          echo "Tests done on ${BRANCH_NAME}"
+      - name: 'post always: Publish test results'
+        uses: mikepenz/action-junit-report@v5
+        if: (always()) && (always())
+        with:
+          report_paths: 'target/surefire-reports/*.xml'
+  docker:
+    name: Docker
+    runs-on: ubuntu-latest
+    needs: [test]
+    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Unstash jar
+        uses: actions/download-artifact@v4
+        with:
+          name: stash-jar
+      - name: echo "$DOCKER_PASS" | docker login ghcr.io -u "$DOCKER_US…
+        run: echo "$DOCKER_PASS" | docker login ghcr.io -u "$DOCKER_USER" --password-stdin
+        env:
+          DOCKER_USER: ${{ secrets.GHCR_CREDS_USERNAME }}
+          DOCKER_PASS: ${{ secrets.GHCR_CREDS_PASSWORD }}
+      - name: docker build -t $IMAGE .
+        run: docker build -t $IMAGE .
+        env:
+          DOCKER_USER: ${{ secrets.GHCR_CREDS_USERNAME }}
+          DOCKER_PASS: ${{ secrets.GHCR_CREDS_PASSWORD }}
+      - name: docker push $IMAGE
+        run: docker push $IMAGE
+        env:
+          DOCKER_USER: ${{ secrets.GHCR_CREDS_USERNAME }}
+          DOCKER_PASS: ${{ secrets.GHCR_CREDS_PASSWORD }}
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: [docker]
+    if: github.ref == 'refs/heads/main' && inputs.DEPLOY_ENV != 'none'
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: ./deploy.sh ${{ inputs.DEPLOY_ENV }} --log-level…
+        uses: nick-fields/retry@v3
+        with:
+          max_attempts: 3
+          timeout_minutes: 10
+          command: ./deploy.sh ${{ inputs.DEPLOY_ENV }} --log-level ${{ inputs.LOG_LEVEL }}
+      - name: npm ci && npm test
+        run: npm ci && npm test
+        working-directory: e2e
+  post:
+    name: post
+    runs-on: ubuntu-latest
+    needs: [checkout, build, test, docker, deploy]
+    if: always()
+    timeout-minutes: 45
+    steps:
+      - name: 'post success: TODO: Slack notification'
+        run: |
+          # TODO: Slack notification
+          # slackSend channel: '#builds', message: "Build ${env.BUILD_URL} succeeded"
+          echo "TODO: unconverted Jenkins step" && exit 1
+        if: needs.checkout.result == 'success' && needs.build.result == 'success' && needs.test.result == 'success' && needs.docker.result == 'success' && needs.deploy.result == 'success'
