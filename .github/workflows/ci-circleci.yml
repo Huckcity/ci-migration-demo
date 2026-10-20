@@ -1,0 +1,237 @@
+name: ci-migration-demo
+on:
+  push:
+    branches: ['**']
+    tags: ['*']
+  pull_request: {}
+  workflow_dispatch:
+    inputs:
+      run-nightly:
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 2 * * *'
+env:
+  CIRCLE_SHA1: ${{ github.sha }}
+  CIRCLE_BRANCH: ${{ github.ref_name }}
+  CIRCLE_TAG: ${{ github.ref_name }}
+jobs:
+  build-test-deploy-build:
+    name: build-test-deploy / build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    container:
+      image: cimg/node:20.11
+    services:
+      postgres:
+        image: cimg/postgres:16.1
+        env:
+          POSTGRES_USER: app
+    env:
+      NODE_ENV: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: v1-deps-${{ hashFiles('package-lock.json') }}
+          restore-keys: v1-deps-
+      - name: npm ci
+        run: npm ci
+      - name: Build
+        run: |
+          npm run build
+          echo "built $CIRCLE_SHA1 on $CIRCLE_BRANCH"
+      - name: Persist workspace
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-build-test-deploy-build
+          path: |
+            dist
+            node_modules
+          include-hidden-files: true
+  build-test-deploy-unit-tests:
+    name: build-test-deploy / unit-tests
+    runs-on: ubuntu-latest
+    needs: [build-test-deploy-build]
+    if: github.event_name != 'schedule'
+    container:
+      image: cimg/node:20.11
+    services:
+      postgres:
+        image: cimg/postgres:16.1
+        env:
+          POSTGRES_USER: app
+    strategy:
+      matrix:
+        index: [0, 1]
+    env:
+      NODE_ENV: test
+      CIRCLE_NODE_INDEX: ${{ matrix.index }}
+      CIRCLE_NODE_TOTAL: '2'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Attach workspace from build-test-deploy-build
+        uses: actions/download-artifact@v4
+        with:
+          name: workspace-build-test-deploy-build
+      - name: Run unit tests
+        run: 'npm run test:unit -- $(circleci tests glob "test/**/*.spec.js" | circleci tests split)'
+      - name: Publish test results
+        uses: mikepenz/action-junit-report@v5
+        if: always()
+        with:
+          report_paths: 'reports/**/*.xml'
+      - name: Store artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage
+  build-test-deploy-e2e-tests:
+    name: build-test-deploy / e2e-tests
+    runs-on: ubuntu-latest
+    needs: [build-test-deploy-build]
+    if: github.event_name != 'schedule' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+    container:
+      image: cimg/node:20.11
+    services:
+      postgres:
+        image: cimg/postgres:16.1
+        env:
+          POSTGRES_USER: app
+    strategy:
+      matrix:
+        index: [0, 1]
+    env:
+      NODE_ENV: test
+      CIRCLE_NODE_INDEX: ${{ matrix.index }}
+      CIRCLE_NODE_TOTAL: '2'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Attach workspace from build-test-deploy-build
+        uses: actions/download-artifact@v4
+        with:
+          name: workspace-build-test-deploy-build
+      - name: Run e2e tests
+        run: 'npm run test:e2e -- $(circleci tests glob "test/**/*.spec.js" | circleci tests split)'
+      - name: Publish test results
+        uses: mikepenz/action-junit-report@v5
+        if: always()
+        with:
+          report_paths: 'reports/**/*.xml'
+      - name: Store artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage
+  build-test-deploy-hold:
+    name: build-test-deploy / hold
+    runs-on: ubuntu-latest
+    needs: [build-test-deploy-unit-tests, build-test-deploy-e2e-tests]
+    if: github.event_name != 'schedule' && github.ref == 'refs/heads/main'
+    environment: manual-approval
+    steps:
+      - run: echo "Approved"
+  build-test-deploy-deploy:
+    name: build-test-deploy / deploy
+    runs-on: ubuntu-latest
+    needs: [build-test-deploy-hold]
+    if: github.event_name != 'schedule' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Attach workspace from build-test-deploy-build
+        uses: actions/download-artifact@v4
+        with:
+          name: workspace-build-test-deploy-build
+      - name: Start ssh-agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+      - name: Deploy
+        run: ./deploy.sh $CIRCLE_TAG
+      - name: 'TODO: Slack notification'
+        run: |
+          # TODO: Slack notification
+          # {"event":"fail","template":"basic_fail_1"}
+          echo "TODO: unconverted step" && exit 1
+  nightly-build:
+    name: nightly / build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    container:
+      image: cimg/node:20.11
+    services:
+      postgres:
+        image: cimg/postgres:16.1
+        env:
+          POSTGRES_USER: app
+    env:
+      NODE_ENV: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: v1-deps-${{ hashFiles('package-lock.json') }}
+          restore-keys: v1-deps-
+      - name: npm ci
+        run: npm ci
+      - name: Build
+        run: |
+          npm run build
+          echo "built $CIRCLE_SHA1 on $CIRCLE_BRANCH"
+      - name: Persist workspace
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-nightly-build
+          path: |
+            dist
+            node_modules
+          include-hidden-files: true
+  nightly-test:
+    name: nightly / test
+    runs-on: ubuntu-latest
+    needs: [nightly-build]
+    if: github.event_name == 'schedule'
+    container:
+      image: cimg/node:20.11
+    services:
+      postgres:
+        image: cimg/postgres:16.1
+        env:
+          POSTGRES_USER: app
+    strategy:
+      matrix:
+        index: [0, 1]
+    env:
+      NODE_ENV: test
+      CIRCLE_NODE_INDEX: ${{ matrix.index }}
+      CIRCLE_NODE_TOTAL: '2'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Attach workspace from nightly-build
+        uses: actions/download-artifact@v4
+        with:
+          name: workspace-nightly-build
+      - name: Run unit tests
+        run: 'npm run test:unit -- $(circleci tests glob "test/**/*.spec.js" | circleci tests split)'
+      - name: Publish test results
+        uses: mikepenz/action-junit-report@v5
+        if: always()
+        with:
+          report_paths: 'reports/**/*.xml'
+      - name: Store artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage
